@@ -1,0 +1,513 @@
+---
+title: "Klingelhutz RNA-seq"
+author: "Michael S. Chimenti"
+date: "08.10.20"
+output:
+  html_document: default
+  html_notebook: default
+fontsize: 12pt
+---
+
+```{r setup, include=FALSE}
+require("knitr")
+knitr::opts_chunk$set(echo = TRUE)
+opts_knit$set(root.dir = "~/collab_proj/klingelhutz/project_rnaseq_july2020/")
+
+```
+
+## Introduction
+
+Goal: Identify the effects of compounds PCB52, PCB52-OH, and PCB126 on gene expression 
+
+This is a time course experiment of 9 hours (9h), Day1, and Day3 treatments using PCB52 (52), PCB52-OH (52 OH), PCB126 (126), or vehicle (Veh).   I would expect the different treatments to group together. The different timepoints may or may not.  
+
+## Comparisons of interest 
+For initial assessment of differential gene expression, everything  should be gauged against average Veh at the corresponding time point.  Depending on how things go, later, we might want to gauge later time points against earlier time points for all the treatment groups. 
+
+
+### Samples were prepared according to: 
+???
+
+### Upstream processing and QC
+
+Samples were processed using the `bcbio v 1.2.2` python pipeline on Argon HPC.  Reference files were as follows: 
+
+ - date: '2020-08-06 17:05:36.267693'
+ - upload: /Shared/Bioinformatics/data/mchiment/klingelhutz/project_rnaseq_july2020/project/final
+ - bcbio_system: /Dedicated/IIHG-argon/bcbio-1.2.2/galaxy/bcbio_system.yaml
+ - galaxy: /Dedicated/IIHG-argon/bcbio-1.2.2/galaxy
+ - work: /Shared/Bioinformatics/data/mchiment/klingelhutz/project_rnaseq_july2020/project/work
+ - genome_build: GRCh37
+    -  ensembl: homo_sapiens_merged_vep_99_GRCh37
+    -  human: true
+    -  snpeff: GRCh37.75
+   
+      MIG: /Dedicated/IIHG-argon/bcbio-1.2.2/genomes/Hsapiens/GRCh37/prioritization/MIG.bed
+      coverage_problem_dir: /Dedicated/IIHG-argon/bcbio-1.2.2/genomes/Hsapiens/GRCh37/coverage/problem_regions
+    rnaseq:
+    -  dexseq: /Dedicated/IIHG-argon/bcbio-1.2.2/genomes/Hsapiens/GRCh37/rnaseq/ref-transcripts.dexseq.gff3
+    -  gene_bed: /Dedicated/IIHG-argon/bcbio-1.2.2/genomes/Hsapiens/GRCh37/rnaseq/ref-transcripts.bed
+    -  rRNA_fa: ../rnaseq/rRNA.fa
+    -  refflat: /Dedicated/IIHG-argon/bcbio-1.2.2/genomes/Hsapiens/GRCh37/rnaseq/ref-transcripts.refFlat
+    -  transcriptome_index:
+    -    tophat: /Dedicated/IIHG-argon/bcbio-1.2.2/genomes/Hsapiens/GRCh37/rnaseq/tophat/GRCh37_transcriptome.ver
+    -  transcripts: /Dedicated/IIHG-argon/bcbio-1.2.2/genomes/Hsapiens/GRCh37/rnaseq/ref-transcripts.gtf
+    -  transcripts_mask: /Dedicated/IIHG-argon/bcbio-1.2.2/genomes/Hsapiens/GRCh37/rnaseq/ref-transcripts
+
+### Example alignment metrics 
+
+     - '%GC': '49'
+    -  5'-3' bias: 1.13
+    -  Average_insert_size: 1395.2
+    -  Average_read_length: 101.0
+    -  Duplicates: 15669904.0
+    -  Duplication Rate of Mapped: 0.7629320967352935
+    -  Exonic Rate: 0.8959
+    -  Intergenic Rate: 0.0154
+    -  Intronic Rate: 0.08869999999999999
+    -  Mapped_paired_reads: 58065898.0
+    -  Mapped_reads: 60445985.0
+    -  Name: Veh_1_9h_lane2_20200718000_S37_L002
+    -  Quality format: standard
+    -  Sequence length: '101'
+    -  Sequences flagged as poor quality: '0'
+    -  Total_reads: 63946608.0
+    -  rRNA: '243583.14299999998'
+    -  rRNA_rate: '0.00822919669822227'
+
+### R packages we will use in this analysis
+
+```{r, imports, warnings=FALSE, message=FALSE, eval=TRUE}
+#negative binomial GLM and related
+library('DESeq2')
+library('calibrate')
+library('tximport')
+library('readr')
+#annotation
+library('biomaRt')
+library("AnnotationDbi")
+library("org.Mm.eg.db")
+#Exploratory analysis
+library('tidyverse')
+library('pcaExplorer')
+library('ggrepel')
+#pathway and gene clusters
+library('DEGreport')
+#Heatmap 
+library(pheatmap)
+library(RColorBrewer)
+library(viridis)
+
+```
+
+
+```{r, function_defs, eval=TRUE, echo=FALSE}
+
+## pull the relevant annotation set from Biomart
+get_annotation <- function(dds, biomart_dataset, idtype){
+  if(is.null(biomart_dataset))
+    stop("Select a species to generate the corresponding annotation.
+         To obtain a list, type mart = useMart('ensembl'), followed by listDatasets(mart).")
+  
+  mart <- useMart(biomart="ENSEMBL_MART_ENSEMBL",
+                  host="www.ensembl.org",
+                  dataset=biomart_dataset, verbose = TRUE)
+  anns <- getBM(attributes = c(idtype, "external_gene_name", "description"),
+                filters = idtype,
+                values = rownames(dds),
+                mart = mart)
+  
+  # keep and match with the ones that are actually there
+  anns2 <- anns[match(rownames(dds), anns[, 1]), ]
+  rownames(anns2) <- rownames(dds)
+  # rename the columns rsp. add row names to be consistent with other function
+  colnames(anns2) <- c("gene_id","gene_name","description")
+  
+  return(anns2)
+}
+
+## Volcano Plot function 
+volcanoplot <- function (res, lfcthresh=2, sigthresh=0.05, main="Volcano Plot", legendpos="topright", labelsig=TRUE, textcx=1, ...) {
+  with(res, plot(log2FoldChange, -log10(pvalue), pch=20, main=main, ...))
+  with(subset(res, padj<sigthresh ), points(log2FoldChange, -log10(pvalue), pch=20, col="red", ...))
+  with(subset(res, abs(log2FoldChange)>lfcthresh), points(log2FoldChange, -log10(pvalue), pch=20, col="orange", ...))
+  with(subset(res, padj<sigthresh & abs(log2FoldChange)>lfcthresh), points(log2FoldChange, -log10(pvalue), pch=20, col="green", ...))
+  if (labelsig) {
+    require(calibrate)
+    with(subset(res, padj<sigthresh & abs(log2FoldChange)>lfcthresh), textxy(log2FoldChange, -log10(pvalue), labs=gene_name, cex=textcx, offset=0.3, ...))
+  }
+  legend(legendpos, xjust=1, yjust=1, legend=c(paste("FDR<",sigthresh,sep=""), paste("|LogFC|>",lfcthresh,sep=""), "both"), pch=20, col=c("red","orange","green"))
+}
+
+#function to quickly get sorted results 
+get_res <- function(dds, meta_col, cond1, cond2, anno, pval = 0.05){
+  res <- results(dds, contrast = c(meta_col,cond1,cond2))
+  res <- na.omit(res)
+  res_sig <- res[res$padj < pval & res$baseMean > 5.0,]
+  res_ord <- res_sig[order(res_sig$padj),]
+  return(res_ord)
+}
+
+get_res_tib_anno <- function(dds, meta_col, cond1, cond2, anno, pval = 0.05){
+  res <- results(dds, contrast = c(meta_col,cond1,cond2))
+  res <- na.omit(res)
+  res_sig <- res[res$padj < pval & res$baseMean > 5.0,]
+  res_ord <- res_sig[order(res_sig$padj),]
+  res_ord$gene_id <- row.names(res_ord)
+  res_ord <- left_join(as_tibble(res_ord), as_tibble(anno), by = "gene_id")
+  return(res_ord)
+}
+
+get_res_iPG <- function(dds, meta_col, cond1, cond2, anno, pval = 0.05){
+  res <- results(dds, contrast = c(meta_col,cond1,cond2))
+  res <- na.omit(res)
+  res <- res[abs(res$log2FoldChange) < 10, ]
+  res$gene_id <- row.names(res)
+  res <- left_join(as_tibble(res), as_tibble(anno), by = "gene_id")
+  write.table(res, file = "res_for_iPath.txt", sep = '\t', 
+              row.names=FALSE)}
+```
+
+
+### Importing the data and converting to counts for DESeq2
+
+We are using the transcriptome quantification from pseudo-alignment here even though we also did full alignment (for QC purposes) owing to the fact that this provides more accurate quantification at the gene level and accounts for differential isoform usage as per: 
+
+**Soneson C, Love MI, Robinson MD. Differential analyses for RNA-seq: transcript-level estimates improve gene-level inferences. F1000Res. 2015;4:1521. Published 2015 Dec 30.** doi:10.12688/f1000research.7563.2
+
+In which the authors write: 
+
+*"In this paper, we show that gene-level abundance estimates and statistical inference offer advantages over transcript-level analyses, in terms of performance and interpretability. We also illustrate that the presence of differential isoform usage can lead to inflated false discovery rates in differential gene expression analyses on simple count matrices but that this can be addressed by incorporating offsets derived from transcript-level abundance estimates. We also show that the problem is relatively minor in several real data sets. Finally, we provide an R package ( tximport) to help users integrate transcript-level abundance estimates from common quantification pipelines into count-based statistical inference engines."*
+
+The metadata table looks like this: 
+```{r, import_meta}
+samples <- read.table("samples.csv", sep=',', header=TRUE)
+head(samples, 10)
+```
+
+```{r, sample_import, echo=FALSE}
+rownames(samples) <- samples$sample
+samples$sample <- as.character(samples$sample)
+
+files <- file.path(getwd(), samples$sample, 'salmon', 'quant.sf')
+names(files) <- samples$sample
+```
+
+Now, we import 'salmon' quantification tables, using the `tx2gene` object to correlate transcripts to genes: 
+```{r, tximport, cache=TRUE}
+tx2gene <- read.csv(file.path(getwd(), "tx2gene.csv"), header = FALSE, as.is = c(1:2)) 
+txi <- tximport(files, type="salmon", tx2gene=tx2gene)
+```
+
+## Creating the analysis object 
+
+First, we'll create a DESeq2 object using a global model.  
+```{r, make_DEseq, cache=TRUE}
+ddsTxi <- DESeqDataSetFromTximport(txi,
+                                   colData = samples,
+                                   design = ~ treat + day + rep)
+
+ddsTxi <- ddsTxi[ rowSums(counts(ddsTxi)) > 5, ]
+ddsTxi <- DESeq(ddsTxi)
+```
+
+
+## Variance stabilizing transformation and PCA visualization
+
+Next, we'll get the Ensembl annotation and perform a variance-stabilizing transformation for visualization: 
+```{r, anno_and_vst}
+#anno <- get_annotation(ddsTxi, 'mmusculus_gene_ensembl','ensembl_gene_id')
+anno <- readRDS("~/Desktop/anno_hg38_ensembl.rds")
+anno <- na.omit(anno)
+vstTxi <- vst(ddsTxi, blind=FALSE)
+colnames(vstTxi) <- vstTxi$sample
+```
+
+
+Finally, we'll look at the PCA plot colored by day:
+
+```{r, PCA_explorer_1, echo=FALSE}
+p <- pcaExplorer::pcaplot(vstTxi, intgroup = c("day"), ellipse = FALSE, text_labels = FALSE, point_size = 3, ntop=500)
+p <- p + ggtitle("PC1 captures variance owing to experiment day")
+show(p)
+```
+
+Looking at the PCA colored by treatment: 
+```{r, PCA_explorer_2, echo=FALSE}
+p <- pcaExplorer::pcaplot(vstTxi, intgroup = c("treat"), ellipse = FALSE, text_labels = FALSE, point_size = 3, ntop=500)
+p <- p + ggtitle("Treatments cluster together except for PCB126 on day 1 and day 3")
+show(p)
+```
+
+This shows that treatments have a small effect size compared to day, with the exception of PCB126. 
+
+Here are PC2 and PC3.  Treatment day is stil the largest determinant of variations.  
+
+```{r, PCA_explorer_3, echo=FALSE}
+p <- pcaExplorer::pcaplot(vstTxi, intgroup = c("treat"), ellipse = FALSE, text_labels = FALSE, point_size = 3, ntop=500, pcX = 2, pcY = 3)
+p <- p + ggtitle("")
+show(p)
+```
+
+### A sample-to-sample distance plot
+
+We can look at a heatmap of "distances" between samples (looking over all gene expression) for patterns.  Samples are clustered hierarchically by their "similiarity" to each other.  Again, "Day" is the driver of biggest differences, with treatment driving within-day variation.   
+
+```{r, sampleDists, echo=FALSE}
+sampleDists <- dist(t(assay(vstTxi)))
+library("RColorBrewer")
+library("pheatmap")
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- vstTxi$sample
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+anno_col <- as.data.frame(colData(vstTxi)[,2:3], row.names = vstTxi$sample)
+pheatmap(sampleDistMatrix,
+         #annotation_col = anno_col,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         colors = colors,
+         annotation_row = anno_col,
+         fontsize = 6)
+```
+
+
+## Create a new factor "group"
+
+Let's create a new factor, "group", that combines treatment and day, to allow us to get DE calculations for specific combinations: 
+
+```{r, groupwiseDE}
+samples$group <- as.factor(paste0(ddsTxi$treat, ddsTxi$day))
+ddsTxi2 <- DESeqDataSetFromTximport(txi, colData = samples, design = ~ rep + group)
+ddsTxi2 <- ddsTxi2[ rowSums(counts(ddsTxi2)) > 5, ]
+ddsTxi2 <- DESeq(ddsTxi2)
+
+
+```
+
+### Treatments vs vehicle at 9 hours (day "zero")
+```{r, get_res_pcb52_zero}
+res_pcb52_zero_tib <- get_res_tib_anno(ddsTxi2, "group", "PCB52zero", "vehzero", anno=anno, pval = 0.05)
+res_pcb52_zero_tib
+```
+
+```{r, volcanoplot1}
+volcanoplot(res_pcb52_zero_tib, lfcthresh = 0.5, textcx = 0.7, xlim = c(-4,4), ylim = c(3,20), main = "PCB52 vs. vehicle at day zero", sigthresh = 0.05)
+```
+
+```{r, get_res_pcb52OH_zero}
+res_pcb52OH_zero_tib <- get_res_tib_anno(ddsTxi2, "group", "PCB52OHzero", "vehzero", anno=anno, pval = 0.05)
+res_pcb52OH_zero_tib
+```
+
+```{r, volcanoplot2}
+volcanoplot(res_pcb52OH_zero_tib, lfcthresh = 0.6, textcx = 0.5, xlim = c(-4,4), ylim = c(3,60), main = "PCB52OH vs. vehicle at day zero", sigthresh = 0.05)
+```
+
+
+
+```{r, get_res_pcb126_zero}
+res_pcb126_zero_tib <- get_res_tib_anno(ddsTxi2, "group", "PCB126zero", "vehzero", anno=anno, pval = 0.05)
+res_pcb126_zero_tib
+```
+
+```{r, volcanoplot3}
+volcanoplot(res_pcb126_zero_tib, lfcthresh = 0.5, textcx = 0.5, xlim = c(-2,2), ylim = c(3,50), main = "PCB126 vs. vehicle at day zero", sigthresh = 0.05)
+```
+
+### Treatments vs vehicle at day "one"
+
+```{r, get_res_pcb52_one}
+res_pcb52_one_tib <- get_res_tib_anno(ddsTxi2, "group", "PCB52one", "vehone", anno=anno, pval = 0.05)
+res_pcb52_one_tib
+```
+
+```{r, volcanoplot4}
+volcanoplot(res_pcb52_one_tib, lfcthresh = 0.5, textcx = 0.7, xlim = c(-4,4), ylim = c(3,20), main = "PCB52 vs. vehicle at day one", sigthresh = 0.05)
+```
+
+
+```{r, get_res_pcb52OH_one}
+res_pcb52OH_one_tib <- get_res_tib_anno(ddsTxi2, "group", "PCB52OHone", "vehone", anno=anno, pval = 0.05)
+res_pcb52OH_one_tib
+```
+
+```{r, volcanoplot5}
+volcanoplot(res_pcb52OH_one_tib, lfcthresh = 0.6, textcx = 0.5, xlim = c(-4,4), ylim = c(3,60), main = "PCB52OH vs. vehicle at day one", sigthresh = 0.05)
+```
+
+```{r, get_res_pcb126_one}
+res_pcb126_one_tib <- get_res_tib_anno(ddsTxi2, "group", "PCB126one", "vehone", anno=anno, pval = 0.05)
+res_pcb126_one_tib
+```
+
+```{r, volcanoplot6}
+volcanoplot(res_pcb126_one_tib, lfcthresh = 0.5, textcx = 0.5, xlim = c(-2,2), ylim = c(3,50), main = "PCB126 vs. vehicle at day one", sigthresh = 0.05)
+```
+
+### Treatments vs vehicle at day three
+```{r, get_res_pcb52_three}
+res_pcb52_three_tib <- get_res_tib_anno(ddsTxi2, "group", "PCB52three", "vehthree", anno=anno, pval = 0.05)
+res_pcb52_three_tib
+```
+
+```{r, volcanoplot7}
+volcanoplot(res_pcb52_three_tib, lfcthresh = 0.5, textcx = 0.7, xlim = c(-4,4), ylim = c(3,20), main = "PCB52 vs. vehicle at day three", sigthresh = 0.05)
+```
+
+```{r, count_plots_samples5}
+res_pcb52_three <- get_res(ddsTxi2, "group", "PCB52three", "vehthree", anno=anno, pval = 0.05)
+DEGreport::degPlot(ddsTxi2, xs = "treat", group = "day", res = res_pcb52_three, n = 6)
+
+```
+
+
+```{r, get_res_pcb52OH_three}
+res_pcb52OH_three_tib <- get_res_tib_anno(ddsTxi2, "group", "PCB52OHthree", "vehthree", anno=anno, pval = 0.05)
+res_pcb52OH_three_tib
+```
+
+```{r, volcanoplot8}
+volcanoplot(res_pcb52OH_three_tib, lfcthresh = 0.6, textcx = 0.5, xlim = c(-4,4), ylim = c(3,60), main = "PCB52OH vs. vehicle at day three", sigthresh = 0.05)
+```
+
+```{r, get_res_pcb126_three}
+res_pcb126_three_tib <- get_res_tib_anno(ddsTxi2, "group", "PCB126three", "vehthree", anno=anno, pval = 0.05)
+res_pcb126_three_tib
+```
+
+```{r, volcanoplot9}
+volcanoplot(res_pcb126_three_tib, lfcthresh = 0.5, textcx = 0.5, xlim = c(-2,2), ylim = c(3,50), main = "PCB126 vs. vehicle at day three", sigthresh = 0.05)
+```
+
+
+```{r, ipath_lists, echo=FALSE, eval=FALSE}
+
+get_res_iPG(ddsTxi2, "group", "PCB126three", "vehthree", anno=anno)
+
+```
+
+### Update: Mar 2021 heatmaps 
+
+### Heatmap of common DE genes at day 0
+
+```{r, plot_combo_heatmap, dpi = 200, fig.height= 7}
+vst_tab <- as.data.frame(assay(vstTxi))
+vst_mat <- as.matrix(vst_tab)
+vst_tab$gene_id <- rownames(vst_tab)
+vst_tab <- left_join(as_tibble(vst_tab), as_tibble(anno), by = "gene_id")
+
+## Subset to genes of interest for heatmap 
+
+goi <- intersect(x = res_pcb126_zero_tib$gene_id, y = res_pcb52OH_zero_tib$gene_id)
+goi <- intersect(x = goi, y = res_pcb52_zero_tib$gene_id)
+labels <- vst_tab %>% filter(gene_id %in% goi) %>% select(c(gene_id, gene_name))
+
+annot <- colData(vstTxi)
+cond <- data.frame(treat = annot$treat, day = annot$day, row.names = annot$sample)
+
+p <- pheatmap(vst_mat[goi,], 
+         labels_row = labels$gene_name,
+         annotation_col = cond,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         color = viridis(8),
+         fontsize_row = 7
+         #scale = "row"
+         )
+
+
+```
+
+
+### Heatmap of common DE genes at day 1 across treatments 
+
+```{r, plot_combo_heatmap2, dpi = 200, fig.height = 7}
+
+
+
+## Subset to genes of interest for heatmap 
+
+goi <- intersect(x = res_pcb126_one_tib$gene_id, y = res_pcb52OH_one_tib$gene_id)
+goi <- intersect(x = goi, y = res_pcb52_one_tib$gene_id)
+labels <- vst_tab %>% filter(gene_id %in% goi) %>% select(c(gene_id, gene_name))
+
+
+
+
+
+p <- pheatmap(vst_mat[goi,], 
+         labels_row = labels$gene_name,
+         annotation_col = cond,
+         cluster_rows = FALSE,
+         cluster_cols = TRUE,
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         color = viridis(8),
+         fontsize_row = 7
+         )
+
+
+#ggsave(file = "combo_heatmap_default.pdf", plot=p, dev = "pdf")
+
+```
+
+### Heatmap of common DE genes at day 3 
+
+```{r, plot_combo_heatmap3, dpi = 200, fig.height=7}
+
+## Subset to genes of interest for heatmap 
+
+goi <- intersect(x = res_pcb126_three_tib$gene_id, y = res_pcb52OH_three_tib$gene_id)
+goi <- intersect(x = goi, y = res_pcb52_three_tib$gene_id)
+labels <- vst_tab %>% filter(gene_id %in% goi) %>% select(c(gene_id, gene_name))
+
+
+p <- pheatmap(vst_mat[goi,], 
+         labels_row = labels$gene_name,
+         annotation_col = cond,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         color = viridis(8),
+         fontsize_row = 7
+         #scale = "row"
+         )
+
+
+```
+
+
+
+
+```{r, genelists, echo=FALSE, eval=FALSE}
+write_csv(res_pcb52_zero_tib, "~/collab_proj/klingelhutz/project_rnaseq_july2020/DEG_pcb52_dayzero_vs_veh.csv")
+write_csv(res_pcb52_one_tib, "~/collab_proj/klingelhutz/project_rnaseq_july2020/DEG_pcb52_dayone_vs_veh.csv")
+write_csv(res_pcb52_three_tib,"~/collab_proj/klingelhutz/project_rnaseq_july2020/DEG_pcb52_daythree_vs_veh.csv")
+write_csv(res_pcb52OH_zero_tib, "~/collab_proj/klingelhutz/project_rnaseq_july2020/DEG_pcb52OH_dayzero_vs_veh.csv")
+write_csv(res_pcb52OH_one_tib, "~/collab_proj/klingelhutz/project_rnaseq_july2020/DEG_pcb52OH_dayone_vs_veh.csv")
+write_csv(res_pcb52OH_three_tib, "~/collab_proj/klingelhutz/project_rnaseq_july2020/DEG_pcb52OH_daythree_vs_veh.csv")
+write_csv(res_pcb126_zero_tib, "~/collab_proj/klingelhutz/project_rnaseq_july2020/DEG_pcb126_dayzero_vs_veh.csv")
+write_csv(res_pcb126_one_tib, "~/collab_proj/klingelhutz/project_rnaseq_july2020/DEG_pcb126_dayone_vs_veh.csv")
+write_csv(res_pcb126_three_tib, "~/collab_proj/klingelhutz/project_rnaseq_july2020/DEG_pcb126_daythree_vs_veh.csv")
+
+vst_tab <- as.data.frame(assay(vstTxi))
+vst_tab$gene <- anno[row.names(vst_tab), "gene_name"]
+write.csv(x=vst_tab, file = "norm_transformed_counts_all_genes.csv")
+
+tab <- as.data.frame(assay(ddsTxi))
+tab$gene_id <- row.names(tab)
+tab <- left_join(x = tab, y = anno, by="gene_id")
+tab2 <- distinct_at(tab, 'gene_name', .keep_all = TRUE)
+write.csv(tab2, file = "raw_counts_all_genes.csv")
+
+```
+
+```{r, sessionInfo}
+
+sessionInfo()
+
+```
